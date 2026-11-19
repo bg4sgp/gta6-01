@@ -1,138 +1,136 @@
-// The scripted playtest: boot the real game in headless Chrome, play it with
-// synthetic keys through the DevTools protocol, and assert the things a player
-// would notice — the run starts, Rook walks, a car drives, crime brings the
-// police, a mission completes and pays, and the save lands in localStorage.
-// It also fails on any page exception or any request that is not same-origin.
-// Usage: node playtest.mjs
-import { spawn } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+// playtest.mjs — a scripted drive through Vice Heat in headless Chrome:
+// title → start → walk → steal a car → drive → Viv's first job end to end →
+// wanted stars and a police response. Also proves the game makes zero
+// network requests and throws zero page errors. Exits non-zero on failure.
+//
+//   CHROME_BIN=<chrome-headless-shell> node playtest.mjs
+
+import { createRequire } from 'node:module';
+import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
+import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = fileURLToPath(new URL('.', import.meta.url));
-const PORT = 8932;
-const DEBUG_PORT = 9932;
+const require = createRequire('/home/hatch/workspace/makefun/shot-tools/package.json');
+const puppeteer = require('puppeteer-core');
+
+const repoDir = fileURLToPath(new URL('.', import.meta.url));
+const gameDir = join(repoDir, 'game');
+const CHROME = process.env.CHROME_BIN
+  ?? '/home/hatch/.cache/puppeteer/chrome-headless-shell/linux-157.0.8103.78/chrome-headless-shell-linux64/chrome-headless-shell';
+const PORT = 8138;
+
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
+const server = createServer((req, res) => {
+  const path = req.url.split('?')[0];
+  try {
+    const body = readFileSync(join(gameDir, path === '/' ? 'index.html' : path));
+    res.writeHead(200, { 'content-type': MIME[extname(path)] ?? 'application/octet-stream' });
+    res.end(body);
+  } catch {
+    res.writeHead(404);
+    res.end('not found');
+  }
+});
+
+let failures = 0;
+function check(label, ok, detail = '') {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? ' — ' + detail : ''}`);
+  if (!ok) failures++;
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function findBrowser() {
-  const base = join(homedir(), '.cache', 'puppeteer', 'chrome-headless-shell');
-  for (const version of readdirSync(base)) {
-    const path = join(base, version, 'chrome-headless-shell-linux64', 'chrome-headless-shell');
-    if (existsSync(path)) return path;
-  }
-  throw new Error('chrome-headless-shell not found under ~/.cache/puppeteer');
-}
-
-const results = [];
-function check(name, ok, detail = '') {
-  results.push({ name, ok, detail });
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
-}
-
-async function main() {
-  const server = spawn('node', ['serve.ts', '--port', String(PORT)], { cwd: root, stdio: 'ignore' });
-  const browser = spawn(findBrowser(), [
-    `--remote-debugging-port=${DEBUG_PORT}`, '--no-sandbox', '--hide-scrollbars',
-    '--window-size=1280,720', '--force-device-scale-factor=1', 'about:blank',
-  ], { stdio: 'ignore' });
-  const requests = [];
-  const exceptions = [];
-  try {
-    let ws;
-    for (let i = 0; i < 40 && !ws; i += 1) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`);
-        const targets = await res.json();
-        const page = targets.find((t) => t.type === 'page');
-        if (page) {
-          ws = new WebSocket(page.webSocketDebuggerUrl);
-          await new Promise((res2, rej) => { ws.onopen = res2; ws.onerror = rej; });
-        }
-      } catch { /* not up yet */ }
-      if (!ws) await sleep(250);
+await new Promise((resolve) => server.listen(PORT, '127.0.0.1', resolve));
+const browser = await puppeteer.launch({
+  executablePath: CHROME,
+  args: ['--no-sandbox', '--disable-dev-shm-usage'],
+});
+try {
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 720 });
+  const pageErrors = [];
+  const externalRequests = [];
+  page.on('pageerror', (e) => pageErrors.push(String(e)));
+  page.on('request', (req) => {
+    if (!req.url().startsWith(`http://127.0.0.1:${PORT}`) && !req.url().startsWith('data:')) {
+      externalRequests.push(req.url());
     }
-    let id = 0;
-    const pending = new Map();
-    ws.onmessage = (msg) => {
-      const data = JSON.parse(msg.data);
-      if (data.id && pending.has(data.id)) { pending.get(data.id)(data); pending.delete(data.id); }
-      if (data.method === 'Network.requestWillBeSent') requests.push(data.params.request.url);
-      if (data.method === 'Runtime.exceptionThrown') exceptions.push(data.params.exceptionDetails.text);
-    };
-    const send = (method, params = {}) => new Promise((resolve) => {
-      id += 1;
-      pending.set(id, resolve);
-      ws.send(JSON.stringify({ id, method, params }));
-    });
-    const evaluate = async (expression) => {
-      const res = await send('Runtime.evaluate', { expression, returnByValue: true });
-      if (res.result && res.result.exceptionDetails) throw new Error(res.result.exceptionDetails.text);
-      return res.result.result.value;
-    };
-    const key = async (code, type) => {
-      await send('Input.dispatchKeyEvent', { type, code, key: code === 'Enter' ? 'Enter' : code.replace('Key', '').toLowerCase() });
-    };
-    const holdKey = async (code, ms) => {
-      await key(code, 'keyDown');
-      await sleep(ms);
-      await key(code, 'keyUp');
-    };
+  });
+  const state = () => page.evaluate(() => window.ViceHeat.state());
+  const call = (fn, ...args) => page.evaluate(fn, ...args);
 
-    await send('Page.enable');
-    await send('Runtime.enable');
-    await send('Network.enable');
-    await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
-    await sleep(1600);
+  await page.goto(`http://127.0.0.1:${PORT}/index.html`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.ViceHeat && window.ViceHeat.ready, { timeout: 15000 });
 
-    check('boots to the title screen', await evaluate('window.VICEHEAT && VICEHEAT.state.mode') === 'title');
-    await key('Enter', 'keyDown');
-    await key('Enter', 'keyUp');
-    await sleep(400);
-    check('Enter starts a run', await evaluate('VICEHEAT.state.mode') === 'play');
-    check('the first mission is live', await evaluate('!!VICEHEAT.state.missions.active') === true);
+  let s = await state();
+  check('title screen shows', s.screen === 'title', `screen=${s.screen}`);
 
-    const y0 = await evaluate('VICEHEAT.state.player.y');
-    await holdKey('KeyW', 650);
-    const y1 = await evaluate('VICEHEAT.state.player.y');
-    check('Rook walks north on W', y1 < y0 - 30, `y ${Math.round(y0)} -> ${Math.round(y1)}`);
+  await page.keyboard.press('Enter');
+  await sleep(300);
+  s = await state();
+  check('Enter starts the game', s.screen === 'playing', `screen=${s.screen}`);
 
-    check('a car can be entered', await evaluate('VICEHEAT.enterNearestCar()') === true);
-    check('the player is driving', await evaluate('!!VICEHEAT.state.player.car') === true);
-    const cx0 = await evaluate('VICEHEAT.state.player.car.x');
-    await holdKey('KeyW', 1500);
-    const speed = await evaluate('Math.hypot(VICEHEAT.state.player.car.vx, VICEHEAT.state.player.car.vy)');
-    const cx1 = await evaluate('VICEHEAT.state.player.car.x');
-    check('the car moves under power', speed > 40 || Math.abs(cx1 - cx0) > 120, `speed ${Math.round(speed)}, dx ${Math.round(cx1 - cx0)}`);
+  const startPos = { x: s.playerX, y: s.playerY };
+  await page.keyboard.down('KeyW');
+  await sleep(650);
+  await page.keyboard.up('KeyW');
+  s = await state();
+  check('walking moves the player', Math.hypot(s.playerX - startPos.x, s.playerY - startPos.y) > 25,
+    `moved to ${s.playerX},${s.playerY}`);
 
-    await evaluate('VICEHEAT.crime()');
-    await sleep(300);
-    const stars = await evaluate('VICEHEAT.state.wanted.stars');
-    check('crime raises wanted stars', stars >= 2, `${stars} stars`);
-    await sleep(2600);
-    const cops = await evaluate("VICEHEAT.state.cars.filter(c => c.role === 'police').length");
-    check('police respond', cops >= 1, `${cops} cruisers`);
+  // Walk up to Viv's diner: job 1 should offer itself and start.
+  await call(() => window.ViceHeat.warp(430, 482));
+  await sleep(400);
+  s = await state();
+  check('first job starts at the diner', s.phase === 'active' && s.missionIndex === 0, `phase=${s.phase}`);
 
-    const cash0 = await evaluate('VICEHEAT.state.cash');
-    await evaluate('(() => { const g = VICEHEAT.state.city.specials.garage; VICEHEAT.teleport(g.x, g.y); })()');
-    await sleep(1200);
-    const cash1 = await evaluate('VICEHEAT.state.cash');
-    const missionIndex = await evaluate('VICEHEAT.state.missions.index');
-    check('the first mission completes and pays', missionIndex === 1 && cash1 > cash0, `cash ${cash0} -> ${cash1}`);
-    const saved = await evaluate("localStorage.getItem('viceheat-save-v1')");
-    check('progress is saved', typeof saved === 'string' && saved.includes('"missionIndex":1'));
+  // Steal the nearest parked car.
+  const carInfo = await call(() => window.ViceHeat.warpNearCar());
+  check('a parked car is in reach', !!carInfo, carInfo ? carInfo.kind : 'none');
+  await page.keyboard.press('KeyE');
+  await sleep(250);
+  s = await state();
+  check('E gets into the car', s.inCar === true);
 
-    const external = requests.filter((u) => !u.startsWith(`http://127.0.0.1:${PORT}`) && !u.startsWith('data:'));
-    check('no request leaves the machine', external.length === 0, external.join(', '));
-    check('no page exceptions', exceptions.length === 0, exceptions.join(' | '));
-    ws.close();
-  } finally {
-    browser.kill();
-    server.kill();
-  }
-  const failed = results.filter((r) => !r.ok);
-  console.log(failed.length === 0 ? `\nPLAYTEST OK (${results.length} checks)` : `\nPLAYTEST FAILED (${failed.length}/${results.length})`);
-  process.exit(failed.length === 0 ? 0 : 1);
+  const carPos = { x: s.playerX, y: s.playerY };
+  await page.keyboard.down('KeyW');
+  await sleep(900);
+  await page.keyboard.up('KeyW');
+  s = await state();
+  check('the car drives', Math.hypot(s.playerX - carPos.x, s.playerY - carPos.y) > 50,
+    `drove to ${s.playerX},${s.playerY}`);
+
+  // Job 1: collect Lola at the marina, deliver her to the Hotel Miramar.
+  await call(() => window.ViceHeat.warp(2980, 1180));
+  await sleep(1300);
+  s = await state();
+  check('pickup step completes', s.stepIndex === 1, `step=${s.stepIndex}`);
+  await call(() => window.ViceHeat.warp(2560, 620));
+  await sleep(500);
+  s = await state();
+  check('first job pays out', s.cash >= 210 && s.missionIndex === 1, `cash=$${s.cash}`);
+
+  // Cause a scene, then keep driving: heat past the second threshold must
+  // raise stars and bring the PAPD out. (Sit still and they would simply
+  // bust us — the meter needs a moving target for a fair check.)
+  await call(() => window.ViceHeat.crime(40));
+  await sleep(300);
+  s = await state();
+  check('crime raises wanted stars', s.stars >= 2, `stars=${s.stars} heat=${s.heat}`);
+  await page.keyboard.down('KeyW');
+  await sleep(2800);
+  await page.keyboard.up('KeyW');
+  s = await state();
+  check('police respond and give chase', s.cops >= 1 && s.screen === 'playing', `cops=${s.cops}`);
+
+  const saved = await call(() => localStorage.getItem('vice-heat-port-azura-save-v1'));
+  check('progress is saved to localStorage', !!saved && saved.includes('"cash"'));
+
+  check('zero page errors', pageErrors.length === 0, pageErrors.join(' | '));
+  check('zero external requests', externalRequests.length === 0, externalRequests.join(' | '));
+} finally {
+  await browser.close();
+  server.close();
 }
-
-await main();
+console.log(failures === 0 ? 'PLAYTEST: ALL PASS' : `PLAYTEST: ${failures} FAILURE(S)`);
+process.exit(failures === 0 ? 0 : 1);

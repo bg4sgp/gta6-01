@@ -1,101 +1,65 @@
-// Take the entry's screenshots: serve game/, open each scene named in shots.json
-// in headless Chrome over the DevTools protocol, wait until the game says the
-// scene is staged (window.__shotReady), and save the frame as a JPEG that fits
-// the gate's 256 KiB cap. Node 22+, no dependencies: CDP runs over the global
-// WebSocket. Usage: node take-shots.mjs
-import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+// take-shots.mjs — renders the entry's screenshots for real: serves game/
+// locally, opens each staged scene from shots.json in headless Chrome, and
+// saves JPEGs into screenshots/. Run AFTER the game is final; the images
+// must be honest renders of the shipped code.
+//
+//   CHROME_BIN=<chrome-headless-shell> node take-shots.mjs
+
+import { createRequire } from 'node:module';
+import { createServer } from 'node:http';
+import { readFileSync, statSync } from 'node:fs';
+import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = fileURLToPath(new URL('.', import.meta.url));
-const PORT = 8931;
-const DEBUG_PORT = 9931;
-const MAX_BYTES = 262144;
+const require = createRequire('/home/hatch/workspace/makefun/shot-tools/package.json');
+const puppeteer = require('puppeteer-core');
 
-function findBrowser() {
-  const base = join(homedir(), '.cache', 'puppeteer', 'chrome-headless-shell');
-  for (const version of readdirSync(base)) {
-    const path = join(base, version, 'chrome-headless-shell-linux64', 'chrome-headless-shell');
-    if (existsSync(path)) return path;
-  }
-  throw new Error('chrome-headless-shell not found under ~/.cache/puppeteer');
-}
+const repoDir = fileURLToPath(new URL('.', import.meta.url));
+const gameDir = join(repoDir, 'game');
+const shots = JSON.parse(readFileSync(join(repoDir, 'shots.json'), 'utf8'));
+const CHROME = process.env.CHROME_BIN
+  ?? '/home/hatch/.cache/puppeteer/chrome-headless-shell/linux-157.0.8103.78/chrome-headless-shell-linux64/chrome-headless-shell';
+const PORT = 8137;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function connectCdp() {
-  for (let i = 0; i < 40; i += 1) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`);
-      const targets = await res.json();
-      const page = targets.find((t) => t.type === 'page');
-      if (page) {
-        const ws = new WebSocket(page.webSocketDebuggerUrl);
-        await new Promise((res2, rej) => { ws.onopen = res2; ws.onerror = rej; });
-        let id = 0;
-        const pending = new Map();
-        ws.onmessage = (msg) => {
-          const data = JSON.parse(msg.data);
-          if (data.id && pending.has(data.id)) {
-            pending.get(data.id)(data);
-            pending.delete(data.id);
-          }
-        };
-        const send = (method, params = {}) => new Promise((resolve) => {
-          id += 1;
-          pending.set(id, resolve);
-          ws.send(JSON.stringify({ id, method, params }));
-        });
-        return { ws, send };
-      }
-    } catch { /* not up yet */ }
-    await sleep(250);
-  }
-  throw new Error('could not connect to the browser DevTools');
-}
-
-async function main() {
-  const shots = JSON.parse(readFileSync(join(root, 'shots.json'), 'utf8'));
-  const server = spawn('node', ['serve.ts', '--port', String(PORT)], { cwd: root, stdio: 'ignore' });
-  const browser = spawn(findBrowser(), [
-    `--remote-debugging-port=${DEBUG_PORT}`, '--no-sandbox', '--hide-scrollbars',
-    '--window-size=1280,720', '--force-device-scale-factor=1', 'about:blank',
-  ], { stdio: 'ignore' });
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
+const server = createServer((req, res) => {
+  const path = req.url.split('?')[0];
+  const file = join(gameDir, path === '/' ? 'index.html' : path);
   try {
-    const { ws, send } = await connectCdp();
-    await send('Page.enable');
-    await send('Runtime.enable');
-    for (const shot of shots) {
-      const url = `http://127.0.0.1:${PORT}/${shot.query}`;
-      await send('Page.navigate', { url });
-      let ready = false;
-      for (let i = 0; i < 60 && !ready; i += 1) {
-        await sleep(300);
-        const res = await send('Runtime.evaluate', { expression: 'window.__shotReady === true', returnByValue: true });
-        ready = res.result && res.result.result && res.result.result.value === true;
-      }
-      if (!ready) throw new Error(`${shot.name}: the scene never staged`);
-      await sleep(650); // let the staged moment breathe before the frame
-      let quality = 84;
-      let data = null;
-      while (quality >= 46) {
-        const shotRes = await send('Page.captureScreenshot', { format: 'jpeg', quality });
-        data = shotRes.result.data;
-        const bytes = Buffer.byteLength(data, 'base64');
-        if (bytes <= MAX_BYTES) break;
-        quality -= 12;
-      }
-      const out = join(root, 'screenshots', shot.name);
-      writeFileSync(out, Buffer.from(data, 'base64'));
-      console.log(`${shot.name}: ${statSync(out).size} bytes at quality ${quality}`);
-    }
-    ws.close();
-  } finally {
-    browser.kill();
-    server.kill();
+    const body = readFileSync(file);
+    res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
+    res.end(body);
+  } catch {
+    res.writeHead(404);
+    res.end('not found');
   }
-}
+});
 
-await main();
+await new Promise((resolve) => server.listen(PORT, '127.0.0.1', resolve));
+const browser = await puppeteer.launch({
+  executablePath: CHROME,
+  args: ['--no-sandbox', '--disable-dev-shm-usage', '--force-device-scale-factor=1'],
+});
+try {
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 720 });
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  for (const shot of shots) {
+    await page.goto(`http://127.0.0.1:${PORT}/index.html${shot.query}`, { waitUntil: 'load' });
+    await page.waitForFunction(() => window.ViceHeat && window.ViceHeat.ready, { timeout: 15000 });
+    await new Promise((r) => setTimeout(r, 1600)); // let traffic and crowds settle into the scene
+    const out = join(repoDir, 'screenshots', shot.name);
+    await page.screenshot({ path: out, type: 'jpeg', quality: 82 });
+    const bytes = statSync(out).size;
+    console.log(`${shot.name}: ${bytes} bytes${bytes > 262144 ? '  <-- OVER the 256 KiB cap!' : ''}`);
+    if (bytes > 262144) process.exitCode = 1;
+  }
+  if (errors.length) {
+    console.error('page errors during shooting:', errors);
+    process.exitCode = 1;
+  }
+} finally {
+  await browser.close();
+  server.close();
+}

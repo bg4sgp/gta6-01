@@ -1,30 +1,26 @@
-// VICE HEAT — Port Azura: the hand-in program for make.fun's gta6-01 bounty (Node 22,
-// standard library only). The game itself is the static site under game/ (open
-// game/index.html in a desktop browser and play; it loads nothing from the network):
-// an open-world crime game in the sunset city of Port Azura — a drivable grid of
-// pastel towers and neon signs with traffic and crowds, cars to steal, a five-star
-// wanted system and the police who answer it, a five-job story for the fixer Viv,
-// fares after it, a minimap HUD, synthesized sound, and a save that keeps your
-// cash and your place in the story. This program copies game/ and screenshots/
-// into the output directory and writes the dossier the judge reads, using the
-// kit's vendored buildDossier library, unchanged.
+// Vice Heat — Port Azura: the hand-in program for make.fun's gta6-01 bounty
+// (Node 22, standard library only). The game itself is the static site in
+// game/ beside this file; this program packages it for the judges: it copies
+// game/ and screenshots/ into the output directory and writes dossier.json
+// with the vendored make.fun library, byte for byte what the scorer rebuilds.
 //
-// Run it locally the way the grader does, with the output directory standing in:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-// Play the game locally with:  node serve.ts   (then open the printed address)
+//
+// MAKEFUN_OUTPUT_DIR stands in for /output outside the grader's container.
+// The program is deterministic: same repository in, same bytes out.
 
 import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const repoRoot = fileURLToPath(new URL('.', import.meta.url));
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const repoDir = fileURLToPath(new URL('.', import.meta.url));
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// The scorer's own caps, mirrored so a bad entry fails here first instead of at the gate:
-// dossier text at most 160 KiB, at most 4 screenshots of at most 256 KiB each, game/ at
-// most 993 entries and 48 MiB in all, and no path under game/ longer than 1000 bytes.
-const DOSSIER_CAPS = {
+// The gate's own caps (reference/gate.json): game/ holds at most 993 entries
+// and 48 MiB with no path over 1,000 bytes; screenshots are at most 4 files
+// of 256 KiB; the dossier's text is capped at 160 KiB.
+const DOSSIER_LIMITS = {
   text_max_bytes: 163840,
   screenshots: { max: 4, max_bytes: 262144 },
   game_max_files: 993,
@@ -32,27 +28,40 @@ const DOSSIER_CAPS = {
   game_path_max_bytes: 1000,
 };
 
-function copyTree(from: string, to: string): void {
-  mkdirSync(to, { recursive: true });
-  if (existsSync(from)) cpSync(from, to, { recursive: true });
-}
-
-function treeSize(dir: string): number {
-  let bytes = 0;
-  for (const name of readdirSync(dir)) {
-    const path = join(dir, name);
-    const stats = statSync(path);
-    bytes += stats.isDirectory() ? treeSize(path) : stats.size;
+function countFiles(dir) {
+  let n = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) n += countFiles(join(dir, entry.name));
+    else n += 1;
   }
-  return bytes;
+  return n;
 }
 
-mkdirSync(outputDir, { recursive: true });
-copyTree(join(repoRoot, 'game'), join(outputDir, 'game'));
-copyTree(join(repoRoot, 'screenshots'), join(outputDir, 'screenshots'));
+mkdirSync(outDir, { recursive: true });
 
-const dossier = buildDossier(outputDir, DOSSIER_CAPS);
-writeFileSync(join(outputDir, 'dossier.json'), dossier);
+const gameSrc = join(repoDir, 'game');
+if (!existsSync(join(gameSrc, 'index.html'))) {
+  throw new Error('game/index.html is missing: the game must live in game/ beside main.ts');
+}
+cpSync(gameSrc, join(outDir, 'game'), { recursive: true });
 
-const gameBytes = treeSize(join(outputDir, 'game'));
-console.log(`vice-heat: game/ ${gameBytes} bytes, dossier.json ${Buffer.byteLength(dossier)} bytes -> ${outputDir}`);
+const shotsSrc = join(repoDir, 'screenshots');
+const shotsOut = join(outDir, 'screenshots');
+mkdirSync(shotsOut, { recursive: true });
+if (existsSync(shotsSrc)) cpSync(shotsSrc, shotsOut, { recursive: true });
+const shotCount = readdirSync(shotsOut).filter((f) => /\.(png|jpe?g)$/i.test(f)).length;
+if (shotCount < 3 || shotCount > 4) {
+  throw new Error(`screenshots/ must hold 3 or 4 images for the judges, found ${shotCount}`);
+}
+
+const dossier = buildDossier(outDir, DOSSIER_LIMITS);
+writeFileSync(join(outDir, 'dossier.json'), dossier);
+
+const gameFiles = countFiles(join(outDir, 'game'));
+const dossierBytes = statSync(join(outDir, 'dossier.json')).size;
+// The dossier is the one file the judges hold against a hard cap (1.5 MiB);
+// fail here, loudly, rather than hand in an entry the gate would refuse.
+if (dossierBytes > 1572864) {
+  throw new Error(`dossier.json is ${dossierBytes} bytes, over the 1.5 MiB cap`);
+}
+console.log(`vice-heat: packaged ${gameFiles} game files and ${shotCount} screenshots; dossier.json is ${dossierBytes} bytes`);
